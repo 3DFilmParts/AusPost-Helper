@@ -287,6 +287,8 @@ function extractPostcode(line, country){
   pats.push("\\d{3,6}");                                       // generic numeric
   const preferStart = country ? country.pcFirst : false;
   for(const p of pats){
+    // whole line is just the postcode (city is on a separate line)
+    if(new RegExp("^("+p+")$","i").test(s)) return {pc:s, rest:""};
     const endRe  =new RegExp("^(.*?)[\\s,]+("+p+")$","i");
     const startRe=new RegExp("^("+p+")[\\s,]+(.*)$","i");
     const em=s.match(endRe), sm=s.match(startRe);
@@ -299,6 +301,32 @@ function extractPostcode(line, country){
     }
   }
   return {pc:"", rest:s};
+}
+
+/* ---------- does a standalone line look like a postcode (OCR-tolerant)? ---------- */
+function looksLikePostcode(s, country){
+  s=s.trim();
+  if(!s) return false;
+  if(country&&country.pc&&new RegExp("^("+country.pc+")$","i").test(s)) return true;
+  const toks=s.split(/\s+/);
+  if(toks.length>3 || s.length>9) return false;          // too long to be a bare postcode
+  if(!/\d/.test(s)) return false;                        // postcodes contain a digit
+  return /^[A-Za-z0-9][A-Za-z0-9 -]*$/.test(s);          // alnum + at most spaces/dashes
+}
+
+/* ---------- repair common OCR slips in a postcode (e.g. UK 0->O) ---------- */
+function ocrFixPostcode(s, country){
+  s=s.toUpperCase().trim();
+  const iso=country?country.iso:"";
+  const dig=c=>({O:"0",I:"1",L:"1",S:"5",B:"8",Z:"2",G:"6"}[c]||c);
+  if(iso==="GB"){
+    const c=s.replace(/\s+/g,"");
+    if(c.length>=5){                                     // inward code = digit + 2 letters
+      const inward=c.slice(-3), outward=c.slice(0,-3);
+      return outward+" "+dig(inward[0])+inward.slice(1);
+    }
+  }
+  return s;
 }
 
 /* ---------- peel a trailing state/province code off the remainder ---------- */
@@ -385,24 +413,51 @@ function parse(raw){
   // name = first line if it doesn't start with a number
   if(lines.length&&!/^\d/.test(lines[0])) res.name=lines.shift();
 
-  // remaining = street line(s) + locality (last line)
+  // remaining lines = street + city + postcode, in whatever arrangement the country uses
   if(lines.length){
-    const last=lines[lines.length-1];
-    const street=lines.slice(0,-1);
-    if(street.length===0){
-      // only one line left — decide if it's a street or a city line
-      const loc=parseLocality(last,res.countryObj);
-      if(loc.postcode||loc.state){res.city=loc.city;res.state=loc.state;res.postcode=loc.postcode;}
-      else res.addr1=last;
-    }else{
-      res.addr1=street[0]||"";
-      res.addr2=street[1]||"";
-      res.addr3=street.slice(2).join(", ");
-      const loc=parseLocality(last,res.countryObj);
-      res.city=loc.city;res.state=loc.state;res.postcode=loc.postcode;
-    }
+    const a=parseAddressLines(lines, res.countryObj);
+    res.addr1=a.addr1; res.addr2=a.addr2; res.addr3=a.addr3;
+    res.city=a.city;   res.state=a.state; res.postcode=a.postcode;
   }
   return res;
+}
+
+/* ---------- split the street / city / postcode lines ----------
+   Handles three layouts: city+postcode on ONE line (US "Brooklyn NY 11249",
+   DE "10115 Berlin"), city & postcode on SEPARATE lines (UK), or no postcode at all. */
+function parseAddressLines(lines, country){
+  const out={addr1:"",addr2:"",addr3:"",city:"",state:"",postcode:""};
+  let work=lines.map(l=>l.trim()).filter(Boolean);
+  if(!work.length) return out;
+
+  const takeCityAbove=()=>{                 // pull a city off the line above the postcode
+    if(!work.length) return;
+    const above=work[work.length-1];
+    if(!/^\d/.test(above) || work.length>=2){ out.city=above; work.pop(); }
+  };
+
+  const last=work[work.length-1];
+  const ex=extractPostcode(last, country);
+
+  if(ex.pc && ex.rest.replace(/[\s,]/g,"").length){     // city + postcode together
+    work.pop(); out.postcode=ex.pc;
+    if(country && country.pcFirst){ out.city=ex.rest; }
+    else { const ps=peelState(ex.rest, country); out.city=ps.city; out.state=ps.state; }
+  } else if(ex.pc){                                     // postcode alone on its line
+    work.pop(); out.postcode=ex.pc; takeCityAbove();
+  } else if(looksLikePostcode(last, country)){          // OCR-mangled postcode alone
+    work.pop(); out.postcode=ocrFixPostcode(last, country); takeCityAbove();
+  } else {                                              // no postcode — last line is the city
+    work.pop(); out.city=last;
+  }
+
+  // a state code may still be sitting on a separate city line (non-pcFirst)
+  if(country && !country.pcFirst && !out.state && out.city){
+    const ps=peelState(out.city, country); out.city=ps.city; out.state=ps.state;
+  }
+
+  out.addr1=work[0]||""; out.addr2=work[1]||""; out.addr3=work.slice(2).join(", ");
+  return out;
 }
 
 /* ---------- UI ---------- */
